@@ -11,6 +11,7 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 
+#include <gtsam_points/config.hpp>
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <gtsam_points/types/point_cloud_gpu.hpp>
 #include <gtsam_points/types/gaussian_voxelmap_cpu.hpp>
@@ -72,7 +73,7 @@ GlobalMappingParams::GlobalMappingParams() {
 GlobalMappingParams::~GlobalMappingParams() {}
 
 GlobalMapping::GlobalMapping(const GlobalMappingParams& params) : params(params) {
-#ifndef BUILD_GTSAM_POINTS_GPU
+#ifndef GTSAM_POINTS_USE_CUDA
   if (params.enable_gpu) {
     logger->error("GPU-based factors cannot be used because GLIM is built without GPU option!!");
   }
@@ -97,7 +98,7 @@ GlobalMapping::GlobalMapping(const GlobalMappingParams& params) : params(params)
     isam2.reset(new gtsam_points::ISAM2ExtDummy(isam2_params));
   }
 
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
   stream_buffer_roundrobin = std::make_shared<gtsam_points::StreamTempBufferRoundRobin>(64);
 #endif
 
@@ -157,6 +158,7 @@ void GlobalMapping::insert_submap(const SubMap::Ptr& submap) {
   }
 
   if (params.enable_imu) {
+    logger->debug("create IMU factor");
     if (submap->odom_frames.front()->frame_id != FrameID::IMU) {
       logger->warn("odom frames are not estimated in the IMU frame while global mapping requires IMU estimation");
     }
@@ -209,13 +211,9 @@ void GlobalMapping::insert_submap(const SubMap::Ptr& submap) {
   }
 
   Callbacks::on_smoother_update(*isam2, *new_factors, *new_values);
-  try {
-    auto result = update_isam2(*new_factors, *new_values);
-    Callbacks::on_smoother_update_result(*isam2, result);
-  } catch (std::exception& e) {
-    logger->error("an exception was caught during global map optimization!!");
-    logger->error(e.what());
-  }
+  auto result = update_isam2(*new_factors, *new_values);
+  Callbacks::on_smoother_update_result(*isam2, result);
+
   new_values.reset(new gtsam::Values);
   new_factors.reset(new gtsam::NonlinearFactorGraph);
 
@@ -233,7 +231,7 @@ void GlobalMapping::insert_submap(int current, const SubMap::Ptr& submap) {
     subsampled_submap = gtsam_points::random_sampling(submap->frame, params.randomsampling_rate, mt);
   }
 
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
   if (params.enable_gpu && !submap->frame->points_gpu) {
     submap->frame = gtsam_points::PointCloudGPU::clone(*submap->frame);
   }
@@ -309,7 +307,7 @@ void GlobalMapping::find_overlapping_submaps(double min_overlap) {
 
       if (false) {
       }
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
       else if (std::dynamic_pointer_cast<gtsam_points::GaussianVoxelMapGPU>(submaps[i]->voxelmaps.back()) && subsampled_submaps[j]->points_gpu) {
         const auto stream_buffer = std::any_cast<std::shared_ptr<gtsam_points::StreamTempBufferRoundRobin>>(stream_buffer_roundrobin)->get_stream_buffer();
         const auto& stream = stream_buffer.first;
@@ -413,6 +411,7 @@ boost::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_co
 
   const auto& current_submap = submaps.back();
 
+  double previous_overlap = 0.0;
   for (int i = 0; i < current; i++) {
     const double dist = (submaps[i]->T_world_origin.translation() - current_submap->T_world_origin.translation()).norm();
     if (dist > params.max_implicit_loop_distance) {
@@ -422,6 +421,7 @@ boost::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_co
     const Eigen::Isometry3d delta = submaps[i]->T_world_origin.inverse() * current_submap->T_world_origin;
     const double overlap = gtsam_points::overlap_auto(submaps[i]->voxelmaps.back(), current_submap->frame, delta);
 
+    previous_overlap = i == current - 1 ? overlap : previous_overlap;
     if (overlap < params.min_implicit_loop_overlap) {
       continue;
     }
@@ -431,7 +431,7 @@ boost::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_co
         factors->emplace_shared<gtsam_points::IntegratedVGICPFactor>(X(i), X(current), voxelmap, subsampled_submaps[current]);
       }
     }
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
     else if (params.registration_error_factor_type == "VGICP_GPU") {
       const auto stream_buffer = std::any_cast<std::shared_ptr<gtsam_points::StreamTempBufferRoundRobin>>(stream_buffer_roundrobin)->get_stream_buffer();
       const auto& stream = stream_buffer.first;
@@ -446,6 +446,14 @@ boost::shared_ptr<gtsam::NonlinearFactorGraph> GlobalMapping::create_matching_co
     }
   }
 
+  if (previous_overlap < std::max(0.25, params.min_implicit_loop_overlap)) {
+    logger->warn("previous submap has only a small overlap with the current submap ({})", previous_overlap);
+    logger->warn("create a between factor to prevent the submap from being isolated");
+    const int last = current - 1;
+    const gtsam::Pose3 init_delta = gtsam::Pose3((submaps[last]->T_world_origin.inverse() * submaps[current]->T_world_origin).matrix());
+    factors->add(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(last), X(current), init_delta, gtsam::noiseModel::Isotropic::Precision(6, 1e6)));
+  }
+
   return factors;
 }
 
@@ -458,14 +466,53 @@ void GlobalMapping::update_submaps() {
 gtsam_points::ISAM2ResultExt GlobalMapping::update_isam2(const gtsam::NonlinearFactorGraph& new_factors, const gtsam::Values& new_values) {
   gtsam_points::ISAM2ResultExt result;
 
+  gtsam::Key indeterminant_nearby_key = 0;
+  try {
 #ifdef GTSAM_USE_TBB
-  auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
-  arena->execute([&] {
+    auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
+    arena->execute([&] {
 #endif
-    result = isam2->update(new_factors, new_values);
+      result = isam2->update(new_factors, new_values);
 #ifdef GTSAM_USE_TBB
-  });
+    });
 #endif
+  } catch (const gtsam::IndeterminantLinearSystemException& e) {
+    logger->error("an indeterminant lienar system exception was caught during global map optimization!!");
+    logger->error(e.what());
+    indeterminant_nearby_key = e.nearbyVariable();
+  } catch (const std::exception& e) {
+    logger->error("an exception was caught during global map optimization!!");
+    logger->error(e.what());
+  }
+
+  if (indeterminant_nearby_key != 0) {
+    const gtsam::Symbol symbol(indeterminant_nearby_key);
+    if (symbol.chr() == 'v' || symbol.chr() == 'b' || symbol.chr() == 'e') {
+      indeterminant_nearby_key = X(symbol.index() / 2);
+    }
+    logger->warn("insert a damping factor at {} to prevent corruption", std::string(gtsam::Symbol(indeterminant_nearby_key)));
+
+    gtsam::Values values = isam2->getLinearizationPoint();
+    gtsam::NonlinearFactorGraph factors = isam2->getFactorsUnsafe();
+    factors.emplace_shared<gtsam_points::LinearDampingFactor>(indeterminant_nearby_key, 6, 1e4);
+
+    gtsam::ISAM2Params isam2_params;
+    if (params.use_isam2_dogleg) {
+      gtsam::ISAM2DoglegParams dogleg_params;
+      isam2_params.setOptimizationParams(dogleg_params);
+    }
+    isam2_params.relinearizeSkip = params.isam2_relinearize_skip;
+    isam2_params.setRelinearizeThreshold(params.isam2_relinearize_thresh);
+
+    if (params.enable_optimization) {
+      isam2.reset(new gtsam_points::ISAM2Ext(isam2_params));
+    } else {
+      isam2.reset(new gtsam_points::ISAM2ExtDummy(isam2_params));
+    }
+
+    isam2->update(factors, values);
+    logger->warn("isam2 was reset");
+  }
 
   return result;
 }
@@ -480,7 +527,7 @@ void GlobalMapping::save(const std::string& path) {
 
   for (const auto& factor : isam2->getFactorsUnsafe()) {
     bool serializable = !boost::dynamic_pointer_cast<gtsam_points::IntegratedMatchingCostFactor>(factor)
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
                         && !boost::dynamic_pointer_cast<gtsam_points::IntegratedVGICPFactorGPU>(factor)
 #endif
       ;
@@ -513,7 +560,7 @@ void GlobalMapping::save(const std::string& path) {
     } else if (boost::dynamic_pointer_cast<gtsam_points::IntegratedVGICPFactor>(factor.second)) {
       type = "vgicp";
     }
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
     else if (boost::dynamic_pointer_cast<gtsam_points::IntegratedVGICPFactorGPU>(factor.second)) {
       type = "vgicp_gpu";
     }
@@ -612,7 +659,7 @@ bool GlobalMapping::load(const std::string& path) {
     subsampled_submaps[i] = subsampled_submap;
 
     if (params.enable_gpu) {
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
       subsampled_submaps[i] = gtsam_points::PointCloudGPU::clone(*subsampled_submaps[i]);
 
       for (int j = 0; j < params.submap_voxelmap_levels; j++) {
@@ -662,7 +709,7 @@ bool GlobalMapping::load(const std::string& path) {
 
     if (type == "vgicp" || type == "vgicp_gpu") {
       if (params.enable_gpu) {
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
         const auto stream_buffer = std::any_cast<std::shared_ptr<gtsam_points::StreamTempBufferRoundRobin>>(stream_buffer_roundrobin)->get_stream_buffer();
         const auto& stream = stream_buffer.first;
         const auto& buffer = stream_buffer.second;

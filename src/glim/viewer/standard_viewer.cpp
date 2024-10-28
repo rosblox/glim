@@ -4,12 +4,13 @@
 
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam_points/config.hpp>
 #include <gtsam_points/factors/integrated_matching_cost_factor.hpp>
 #include <gtsam_points/optimizers/isam2_result_ext.hpp>
 #include <gtsam_points/optimizers/incremental_fixed_lag_smoother_with_fallback.hpp>
 #include <gtsam_points/optimizers/levenberg_marquardt_optimization_status.hpp>
 
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
 #include <gtsam_points/factors/integrated_vgicp_factor_gpu.hpp>
 #endif
 
@@ -57,6 +58,16 @@ StandardViewer::StandardViewer() : logger(create_module_logger("viewer")) {
 
   z_range = config.param("standard_viewer", "default_z_range", Eigen::Vector2d(-2.0, 4.0)).cast<float>();
   auto_z_range << 0.0f, 0.0f;
+
+  show_mapping_tools = false;
+  min_overlap = 0.2f;
+
+  points_alpha = config.param("standard_viewer", "points_alpha", 1.0);
+  factors_alpha = config.param("standard_viewer", "factors_alpha", 1.0);
+
+  point_size = config.param("standard_viewer", "point_size", 1.0);
+  point_size_metric = config.param("standard_viewer", "point_size_metric", false);
+  point_shape_circle = config.param("standard_viewer", "point_shape_circle", true);
 
   trajectory.reset(new TrajectoryManager);
 
@@ -265,14 +276,18 @@ void StandardViewer::set_callbacks() {
             }
 
             const Eigen::Vector3d pt1 = static_cast<const gtsam_points::IntegratedMatchingCostFactor*>(factor)->get_fixed_target_pose().translation();
-            return std::make_tuple(found0->second.translation(), pt1.cast<float>(), Eigen::Vector4f(0.0f, 1.0f, 0.0f, 0.5f), Eigen::Vector4f(1.0f, 0.0f, 0.0f, 0.5f));
+            return std::make_tuple(
+              found0->second.translation(),
+              pt1.cast<float>(),
+              Eigen::Vector4f(0.0f, 1.0f, 0.0f, factors_alpha),
+              Eigen::Vector4f(1.0f, 0.0f, 0.0f, factors_alpha));
           };
 
           new_factor_lines.emplace_back(factor, l);
           continue;
         }
 
-#ifdef BUILD_GTSAM_POINTS_GPU
+#ifdef GTSAM_POINTS_USE_CUDA
         const auto gpu_factor = boost::dynamic_pointer_cast<gtsam_points::IntegratedVGICPFactorGPU>(factor);
         if (gpu_factor) {
           const auto l = [this, idx0](const gtsam::NonlinearFactor* factor) -> std::optional<FactorLine> {
@@ -282,7 +297,7 @@ void StandardViewer::set_callbacks() {
             }
 
             const Eigen::Vector3f pt1 = static_cast<const gtsam_points::IntegratedVGICPFactorGPU*>(factor)->get_fixed_target_pose().translation();
-            return std::make_tuple(found0->second.translation(), pt1, Eigen::Vector4f(0.0f, 1.0f, 0.0f, 0.5f), Eigen::Vector4f(1.0f, 0.0f, 0.0f, 0.5f));
+            return std::make_tuple(found0->second.translation(), pt1, Eigen::Vector4f(0.0f, 1.0f, 0.0f, factors_alpha), Eigen::Vector4f(1.0f, 0.0f, 0.0f, factors_alpha));
           };
 
           new_factor_lines.emplace_back(factor, l);
@@ -306,7 +321,11 @@ void StandardViewer::set_callbacks() {
             return std::nullopt;
           }
 
-          return std::make_tuple(found0->second.translation(), found1->second.translation(), Eigen::Vector4f(0.0f, 1.0f, 0.0f, 1.0f), Eigen::Vector4f(0.0f, 1.0f, 0.0f, 1.0f));
+          return std::make_tuple(
+            found0->second.translation(),
+            found1->second.translation(),
+            Eigen::Vector4f(0.0f, 1.0f, 0.0f, factors_alpha),
+            Eigen::Vector4f(0.0f, 1.0f, 0.0f, factors_alpha));
         };
 
         new_factor_lines.emplace_back(factor, l);
@@ -342,7 +361,7 @@ void StandardViewer::set_callbacks() {
       }
 
       auto viewer = guik::viewer();
-      viewer->update_drawable("odometry_factors", std::make_shared<glk::ThinLines>(line_vertices, line_colors), guik::VertexColor().make_transparent());
+      viewer->update_drawable("odometry_factors", std::make_shared<glk::ThinLines>(line_vertices, line_colors), guik::VertexColor().set_alpha(factors_alpha));
     });
   });
 
@@ -461,7 +480,7 @@ void StandardViewer::set_callbacks() {
         lines.push_back(submap_keyframes[factor.second].translation());
       }
 
-      sub_viewer->update_drawable("factors", std::make_shared<glk::ThinLines>(lines), guik::FlatGreen());
+      sub_viewer->update_drawable("factors", std::make_shared<glk::ThinLines>(lines), guik::FlatGreen().set_alpha(factors_alpha));
     });
   });
 
@@ -486,7 +505,7 @@ void StandardViewer::set_callbacks() {
       auto viewer = guik::LightViewer::instance();
       auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(submap->frame->points, submap->frame->size());
       auto shader_setting = guik::Rainbow(T_world_origin->matrix().cast<float>());
-      shader_setting.add("point_scale", 0.1f);
+      shader_setting.set_alpha(points_alpha);
 
       if (enable_partial_rendering) {
         cloud_buffer->enable_partial_rendering(partial_rendering_budget);
@@ -535,7 +554,7 @@ void StandardViewer::set_callbacks() {
         }
       }
 
-      viewer->update_drawable("factors", std::make_shared<glk::ThinLines>(submap_positions, indices), guik::FlatGreen());
+      viewer->update_drawable("factors", std::make_shared<glk::ThinLines>(submap_positions, indices), guik::FlatGreen().set_alpha(factors_alpha));
       viewer->shader_setting().add<Eigen::Vector2f>("z_range", auto_z_range + z_range);
     });
   });
@@ -573,6 +592,15 @@ void StandardViewer::viewer_loop() {
   auto viewer = guik::LightViewer::instance(Eigen::Vector2i(config.param("standard_viewer", "viewer_width", 2560), config.param("standard_viewer", "viewer_height", 1440)));
   viewer->enable_vsync();
   viewer->shader_setting().add("z_range", z_range);
+  viewer->shader_setting().set_point_size(point_size);
+
+  if (point_size_metric) {
+    viewer->shader_setting().set_point_scale_metric();
+  }
+
+  if (point_shape_circle) {
+    viewer->shader_setting().set_point_shape_circle();
+  }
 
   if (enable_partial_rendering) {
     viewer->enable_partial_rendering(1e-1);
@@ -705,6 +733,11 @@ void StandardViewer::drawable_selection() {
     show_submaps = show_factors = show_mapping;
   }
 
+  ImGui::SameLine();
+  if (ImGui::Button("Tools")) {
+    show_mapping_tools = true;
+  }
+
   ImGui::Checkbox("submaps", &show_submaps);
   ImGui::SameLine();
   ImGui::Checkbox("factors", &show_factors);
@@ -723,6 +756,21 @@ void StandardViewer::drawable_selection() {
     ImGui::Text("stamp:%.3f ~ %.3f", last_point_stamps.first, last_point_stamps.second);
     ImGui::Text("vel:%.3f %.3f %.3f", last_imu_vel[0], last_imu_vel[1], last_imu_vel[2]);
     ImGui::Text("bias:%.3f %.3f %.3f %.3f %.3f %.3f", last_imu_bias[0], last_imu_bias[1], last_imu_bias[2], last_imu_bias[3], last_imu_bias[4], last_imu_bias[5]);
+    ImGui::End();
+  }
+
+  if (show_mapping_tools) {
+    ImGui::Begin("mapping tools", &show_mapping_tools, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::DragFloat("Min overlap", &min_overlap, 0.01f, 0.01f, 1.0f);
+    if (ImGui::Button("Find overlapping submaps")) {
+      logger->info("finding overlapping submaps...");
+      GlobalMappingCallbacks::request_to_find_overlapping_submaps(min_overlap);
+    }
+
+    if (ImGui::Button("Optimize")) {
+      logger->info("optimizing...");
+      GlobalMappingCallbacks::request_to_optimize();
+    }
     ImGui::End();
   }
 }
