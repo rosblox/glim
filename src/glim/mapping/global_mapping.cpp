@@ -54,6 +54,10 @@ GlobalMappingParams::GlobalMappingParams() {
   between_registration_type = config.param<std::string>("global_mapping", "between_registration_type", "GICP");
   registration_error_factor_type = config.param<std::string>("global_mapping", "registration_error_factor_type", "VGICP");
   submap_voxel_resolution = config.param<double>("global_mapping", "submap_voxel_resolution", 1.0);
+  submap_voxel_resolution_max = config.param<double>("global_mapping", "submap_voxel_resolution_max", submap_voxel_resolution);
+  submap_voxel_resolution_dmin = config.param<double>("global_mapping", "submap_voxel_resolution_dmin", 5.0);
+  submap_voxel_resolution_dmax = config.param<double>("global_mapping", "submap_voxel_resolution_dmax", 20.0);
+
   submap_voxelmap_levels = config.param<int>("global_mapping", "submap_voxelmap_levels", 2);
   submap_voxelmap_scaling_factor = config.param<double>("global_mapping", "submap_voxelmap_scaling_factor", 2.0);
 
@@ -224,6 +228,13 @@ void GlobalMapping::insert_submap(const SubMap::Ptr& submap) {
 void GlobalMapping::insert_submap(int current, const SubMap::Ptr& submap) {
   submap->voxelmaps.clear();
 
+  // Adaptively determine the voxel resolution based on the median distance
+  const int max_scan_count = 256;
+  const double dist_median = gtsam_points::median_distance(submap->frame, max_scan_count);
+  const double p = std::max(0.0, std::min(1.0, (dist_median - params.submap_voxel_resolution_dmin) / (params.submap_voxel_resolution_dmax - params.submap_voxel_resolution_dmin)));
+  const double base_resolution = params.submap_voxel_resolution + p * (params.submap_voxel_resolution_max - params.submap_voxel_resolution);
+
+  // Create frame and voxelmaps
   gtsam_points::PointCloud::ConstPtr subsampled_submap;
   if (params.randomsampling_rate > 0.99) {
     subsampled_submap = submap->frame;
@@ -244,7 +255,7 @@ void GlobalMapping::insert_submap(int current, const SubMap::Ptr& submap) {
     }
 
     for (int i = 0; i < params.submap_voxelmap_levels; i++) {
-      const double resolution = params.submap_voxel_resolution * std::pow(params.submap_voxelmap_scaling_factor, i);
+      const double resolution = base_resolution * std::pow(params.submap_voxelmap_scaling_factor, i);
       auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapGPU>(resolution);
       voxelmap->insert(*submap->frame);
       submap->voxelmaps.push_back(voxelmap);
@@ -254,7 +265,7 @@ void GlobalMapping::insert_submap(int current, const SubMap::Ptr& submap) {
 
   if (submap->voxelmaps.empty()) {
     for (int i = 0; i < params.submap_voxelmap_levels; i++) {
-      const double resolution = params.submap_voxel_resolution * std::pow(params.submap_voxelmap_scaling_factor, i);
+      const double resolution = base_resolution * std::pow(params.submap_voxelmap_scaling_factor, i);
       auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(resolution);
       voxelmap->insert(*subsampled_submap);
       submap->voxelmaps.push_back(voxelmap);
@@ -510,8 +521,8 @@ gtsam_points::ISAM2ResultExt GlobalMapping::update_isam2(const gtsam::NonlinearF
       isam2.reset(new gtsam_points::ISAM2ExtDummy(isam2_params));
     }
 
-    isam2->update(factors, values);
-    logger->warn("isam2 was reset");
+    logger->warn("reset isam2");
+    return update_isam2(factors, values);
   }
 
   return result;
@@ -603,6 +614,9 @@ void GlobalMapping::save(const std::string& path) {
 
     submaps[i]->save((boost::format("%s/%06d") % path % i).str());
   }
+
+  logger->info("saving config");
+  GlobalConfig::instance()->dump(path + "/config");
 }
 
 std::vector<Eigen::Vector4d> GlobalMapping::export_points() {
@@ -652,7 +666,19 @@ bool GlobalMapping::load(const std::string& path) {
       return false;
     }
 
-    gtsam_points::PointCloud::Ptr subsampled_submap = gtsam_points::random_sampling(submap->frame, params.randomsampling_rate, mt);
+    // Adaptively determine the voxel resolution based on the median distance
+    const int max_scan_count = 256;
+    const double dist_median = gtsam_points::median_distance(submap->frame, max_scan_count);
+    const double p =
+      std::max(0.0, std::min(1.0, (dist_median - params.submap_voxel_resolution_dmin) / (params.submap_voxel_resolution_dmax - params.submap_voxel_resolution_dmin)));
+    const double base_resolution = params.submap_voxel_resolution + p * (params.submap_voxel_resolution_max - params.submap_voxel_resolution);
+
+    gtsam_points::PointCloud::Ptr subsampled_submap;
+    if (params.randomsampling_rate > 0.99) {
+      subsampled_submap = submap->frame;
+    } else {
+      subsampled_submap = gtsam_points::random_sampling(submap->frame, params.randomsampling_rate, mt);
+    }
 
     submaps[i] = submap;
     submaps[i]->voxelmaps.clear();
@@ -663,7 +689,7 @@ bool GlobalMapping::load(const std::string& path) {
       subsampled_submaps[i] = gtsam_points::PointCloudGPU::clone(*subsampled_submaps[i]);
 
       for (int j = 0; j < params.submap_voxelmap_levels; j++) {
-        const double resolution = params.submap_voxel_resolution * std::pow(params.submap_voxelmap_scaling_factor, j);
+        const double resolution = base_resolution * std::pow(params.submap_voxelmap_scaling_factor, j);
         auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapGPU>(resolution);
         voxelmap->insert(*subsampled_submaps[i]);
         submaps[i]->voxelmaps.push_back(voxelmap);
@@ -673,7 +699,7 @@ bool GlobalMapping::load(const std::string& path) {
 #endif
     } else {
       for (int j = 0; j < params.submap_voxelmap_levels; j++) {
-        const double resolution = params.submap_voxel_resolution * std::pow(params.submap_voxelmap_scaling_factor, j);
+        const double resolution = base_resolution * std::pow(params.submap_voxelmap_scaling_factor, j);
         auto voxelmap = std::make_shared<gtsam_points::GaussianVoxelMapCPU>(resolution);
         voxelmap->insert(*subsampled_submaps[i]);
         submaps[i]->voxelmaps.push_back(voxelmap);
@@ -685,6 +711,7 @@ bool GlobalMapping::load(const std::string& path) {
 
   gtsam::Values values;
   gtsam::NonlinearFactorGraph graph;
+  bool needs_recover = false;
 
   try {
     logger->info("deserializing factor graph");
@@ -692,13 +719,22 @@ bool GlobalMapping::load(const std::string& path) {
   } catch (boost::archive::archive_exception e) {
     logger->error("failed to deserialize factor graph!!");
     logger->error(e.what());
+  } catch (std::exception& e) {
+    logger->error("failed to deserialize factor graph!!");
+    logger->error(e.what());
+    needs_recover = true;
   }
+
   try {
     logger->info("deserializing values");
     gtsam::deserializeFromBinaryFile(path + "/values.bin", values);
   } catch (boost::archive::archive_exception e) {
-    logger->error("failed to deserialize factor graph!!");
+    logger->error("failed to deserialize values!!");
     logger->error(e.what());
+  } catch (std::exception& e) {
+    logger->error("failed to deserialize values!!");
+    logger->error(e.what());
+    needs_recover = true;
   }
 
   logger->info("creating matching cost factors");
@@ -730,6 +766,21 @@ bool GlobalMapping::load(const std::string& path) {
     }
   }
 
+  const size_t num_factors_before = graph.size();
+  const auto remove_loc = std::remove_if(graph.begin(), graph.end(), [](const auto& factor) { return factor == nullptr; });
+  graph.erase(remove_loc, graph.end());
+  if (graph.size() != num_factors_before) {
+    logger->warn("removed {} invalid factors", num_factors_before - graph.size());
+    needs_recover = true;
+  }
+
+  if (needs_recover) {
+    logger->warn("recovering factor graph");
+    const auto recovered = recover_graph(graph, values);
+    graph.add(recovered.first);
+    values.insert_or_assign(recovered.second);
+  }
+
   logger->info("optimize");
   Callbacks::on_smoother_update(*isam2, graph, values);
   auto result = update_isam2(graph, values);
@@ -741,6 +792,144 @@ bool GlobalMapping::load(const std::string& path) {
   logger->info("done");
 
   return true;
+}
+
+void GlobalMapping::recover_graph() {
+  const auto recovered = recover_graph(isam2->getFactorsUnsafe(), isam2->calculateEstimate());
+  update_isam2(recovered.first, recovered.second);
+}
+
+// Recover the graph by adding missing values and factors
+std::pair<gtsam::NonlinearFactorGraph, gtsam::Values> GlobalMapping::recover_graph(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) const {
+  logger->info("recovering graph");
+  bool enable_imu = false;
+  for (const auto& value : values) {
+    const char chr = gtsam::Symbol(value.key).chr();
+    enable_imu |= (chr == 'e' || chr == 'v' || chr == 'b');
+  }
+  for (const auto& factor : graph) {
+    enable_imu |= boost::dynamic_pointer_cast<gtsam::ImuFactor>(factor) != nullptr;
+  }
+
+  logger->info("enable_imu={}", enable_imu);
+
+  logger->info("creating connectivity map");
+  bool prior_exists = false;
+  std::unordered_map<gtsam::Key, std::set<gtsam::Key>> connectivity_map;
+  for (const auto& factor : graph) {
+    if (!factor) {
+      continue;
+    }
+
+    for (const auto key : factor->keys()) {
+      for (const auto key2 : factor->keys()) {
+        connectivity_map[key].insert(key2);
+      }
+    }
+
+    if (factor->keys().size() == 1 && factor->keys()[0] == X(0)) {
+      prior_exists |= boost::dynamic_pointer_cast<gtsam_points::LinearDampingFactor>(factor) != nullptr;
+    }
+  }
+
+  logger->info("fixing missing values and factors");
+  const auto prior_noise3 = gtsam::noiseModel::Isotropic::Precision(3, 1e6);
+  const auto prior_noise6 = gtsam::noiseModel::Isotropic::Precision(6, 1e6);
+
+  gtsam::NonlinearFactorGraph new_factors;
+  gtsam::Values new_values;
+
+  if (!prior_exists) {
+    logger->warn("X0 prior is missing");
+    new_factors.emplace_shared<gtsam_points::LinearDampingFactor>(X(0), 6, params.init_pose_damping_scale);
+  }
+
+  for (int i = 0; i < submaps.size(); i++) {
+    if (!values.exists(X(i))) {
+      logger->warn("X{} is missing", i);
+      new_values.insert(X(i), gtsam::Pose3(submaps[i]->T_world_origin.matrix()));
+    }
+
+    if (connectivity_map[X(i)].count(X(i + 1)) == 0 && i != submaps.size() - 1) {
+      logger->warn("X{} -> X{} is missing", i, i + 1);
+
+      const Eigen::Isometry3d delta = submaps[i]->origin_odom_frame()->T_world_sensor().inverse() * submaps[i + 1]->origin_odom_frame()->T_world_sensor();
+      new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(i), X(i + 1), gtsam::Pose3(delta.matrix()), prior_noise6);
+    }
+
+    if (!enable_imu) {
+      continue;
+    }
+
+    const auto submap = submaps[i];
+    const gtsam::imuBias::ConstantBias imu_biasL(submap->frames.front()->imu_bias);
+    const gtsam::imuBias::ConstantBias imu_biasR(submap->frames.back()->imu_bias);
+    const Eigen::Vector3d v_origin_imuL = submap->T_world_origin.linear().inverse() * submap->frames.front()->v_world_imu;
+    const Eigen::Vector3d v_origin_imuR = submap->T_world_origin.linear().inverse() * submap->frames.back()->v_world_imu;
+
+    if (i != 0) {
+      if (!values.exists(E(i * 2))) {
+        logger->warn("E{} is missing", i * 2);
+        new_values.insert(E(i * 2), gtsam::Pose3((submap->T_world_origin * submap->T_origin_endpoint_L).matrix()));
+      }
+      if (!values.exists(V(i * 2))) {
+        logger->warn("V{} is missing", i * 2);
+        new_values.insert(V(i * 2), (submap->T_world_origin.linear() * v_origin_imuL).eval());
+      }
+      if (!values.exists(B(i * 2))) {
+        logger->warn("B{} is missing", i * 2);
+        new_values.insert(B(i * 2), imu_biasL);
+      }
+
+      if (connectivity_map[X(i)].count(E(i * 2)) == 0) {
+        logger->warn("X{} -> E{} is missing", i, i * 2);
+        new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(i), E(i * 2), gtsam::Pose3(submap->T_origin_endpoint_L.matrix()), prior_noise6);
+      }
+      if (connectivity_map[X(i)].count(V(i * 2)) == 0) {
+        logger->warn("X{} -> V{} is missing", i, i * 2);
+        new_factors.emplace_shared<gtsam_points::RotateVector3Factor>(X(i), V(i * 2), v_origin_imuL, prior_noise3);
+      }
+      if (connectivity_map[B(i * 2)].count(B(i * 2)) == 0) {
+        logger->warn("B{} -> B{} is missing", i * 2, i * 2);
+        new_factors.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(B(i * 2), imu_biasL, prior_noise6);
+      }
+
+      if (connectivity_map[B(i * 2)].count(B(i * 2 + 1)) == 0) {
+        logger->warn("B{} -> B{} is missing", i * 2, i * 2 + 1);
+        new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>>(B(i * 2), B(i * 2 + 1), gtsam::imuBias::ConstantBias(), prior_noise6);
+      }
+    }
+
+    if (!values.exists(E(i * 2 + 1))) {
+      logger->warn("E{} is missing", i * 2 + 1);
+      new_values.insert(E(i * 2 + 1), gtsam::Pose3((submap->T_world_origin * submap->T_origin_endpoint_R).matrix()));
+    }
+    if (!values.exists(V(i * 2 + 1))) {
+      logger->warn("V{} is missing", i * 2 + 1);
+      new_values.insert(V(i * 2 + 1), (submap->T_world_origin.linear() * v_origin_imuR).eval());
+    }
+    if (!values.exists(B(i * 2 + 1))) {
+      logger->warn("B{} is missing", i * 2 + 1);
+      new_values.insert(B(i * 2 + 1), imu_biasR);
+    }
+
+    if (connectivity_map[X(i)].count(E(i * 2 + 1)) == 0) {
+      logger->warn("X{} -> E{} is missing", i, i * 2 + 1);
+      new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(X(i), E(i * 2 + 1), gtsam::Pose3(submap->T_origin_endpoint_R.matrix()), prior_noise6);
+    }
+    if (connectivity_map[X(i)].count(V(i * 2 + 1)) == 0) {
+      logger->warn("X{} -> V{} is missing", i, i * 2 + 1);
+      new_factors.emplace_shared<gtsam_points::RotateVector3Factor>(X(i), V(i * 2 + 1), v_origin_imuR, prior_noise3);
+    }
+    if (connectivity_map[B(i * 2 + 1)].count(B(i * 2 + 1)) == 0) {
+      logger->warn("B{} -> B{} is missing", i * 2 + 1, i * 2 + 1);
+      new_factors.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(B(i * 2 + 1), imu_biasR, prior_noise6);
+    }
+  }
+
+  logger->info("recovering done");
+
+  return {new_factors, new_values};
 }
 
 }  // namespace glim

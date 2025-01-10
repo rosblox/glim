@@ -38,6 +38,9 @@ public:
 
   std::string registration_error_factor_type;
   double submap_voxel_resolution;
+  double submap_voxel_resolution_max;
+  double submap_voxel_resolution_dmin;
+  double submap_voxel_resolution_dmax;
   int submap_voxelmap_levels;
   double submap_voxelmap_scaling_factor;
 
@@ -83,6 +86,9 @@ private:
 
   void update_submaps();
   gtsam_points::ISAM2ResultExt update_isam2(const gtsam::NonlinearFactorGraph& new_factors, const gtsam::Values& new_values);
+
+  void recover_graph() override;
+  std::pair<gtsam::NonlinearFactorGraph, gtsam::Values> recover_graph(const gtsam::NonlinearFactorGraph& graph, const gtsam::Values& values) const;
 
 private:
   using Params = GlobalMappingParams;
