@@ -9,13 +9,13 @@ RUN apt-get update \
 
 # without viewer and CUDA
 COPY . /root/glim
-WORKDIR /root/glim/build
-RUN cmake .. \
-  -DBUILD_WITH_CUDA=OFF \
-  -DBUILD_WITH_VIEWER=OFF \
-  -DBUILD_WITH_MARCH_NATIVE=OFF \
-  -DCMAKE_BUILD_TYPE=Release
-RUN  make -j$(nproc)
+# WORKDIR /root/glim/build
+# RUN cmake .. \
+#   -DBUILD_WITH_CUDA=OFF \
+#   -DBUILD_WITH_VIEWER=OFF \
+#   -DBUILD_WITH_MARCH_NATIVE=OFF \
+#   -DCMAKE_BUILD_TYPE=Release
+# RUN  make -j$(nproc)
 
 # with viewer
 WORKDIR /root/glim/build
